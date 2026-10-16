@@ -12,6 +12,7 @@ SEED_CLI = os.path.join(ROOT, "seedvr2", "inference_cli.py")
 SEED_MODELS = os.path.join(ROOT, "models", "seedvr2")
 os.environ["PYTHONUTF8"] = "1"; os.environ["PYTHONIOENCODING"] = "utf-8"
 BIG_GPU = os.environ.get("MJU_BIG_GPU") == "1"  # cloud A100/H100: no offload, bigger batches
+NO_OFFLOAD = os.environ.get("MJU_NO_OFFLOAD") == "1"  # cloud 24-32 GB cards: keep models on the GPU (no CPU offload)
 NOWIN = 0x08000000 if os.name == "nt" else 0
 
 HEAVY = "Heavy restore (very bad footage)"
@@ -156,9 +157,11 @@ class Job:
         self.face_r = None
         self.seed_worker = None
         self.worker_disabled = False
+        self.skip_chunks = set()   # chunk indexes another machine already finished (cloud: rendered elsewhere, merged on the PC)
+        self.no_concat = False     # cloud: stop after the chunks; the PC joins them
 
     def _run_seed(self, command):
-        if BIG_GPU or self.worker_disabled or os.environ.get('MJU_PERSISTENT_SEED', '1') == '0':
+        if BIG_GPU or NO_OFFLOAD or self.worker_disabled or os.environ.get('MJU_PERSISTENT_SEED', '1') == '0':
             return run(command, log=self.log, cwd=os.path.join(ROOT, 'seedvr2'))
         from seed_worker import SeedWorker
         try:
@@ -199,7 +202,8 @@ class Job:
             self._run_seed([PY, SEED_CLI, vid, "--output", sd, "--output_format", "png", "--model_dir", SEED_MODELS,
                  "--dit_model", "seedvr2_ema_3b_fp8_e4m3fn.safetensors", "--resolution", str(res),
                  "--batch_size", "21", "--temporal_overlap", "4", "--color_correction", "lab",
-                 *(["--batch_size", "45"] if BIG_GPU else ["--dit_offload_device", "cpu", "--vae_offload_device", "cpu"]),
+                 *(["--batch_size", os.environ.get("MJU_SEED_BATCH", "45")] if BIG_GPU else
+                   (["--batch_size", os.environ.get("MJU_SEED_BATCH", "21")] if NO_OFFLOAD else ["--dit_offload_device", "cpu", "--vae_offload_device", "cpu"])),
                  "--vae_encode_tiled", "--vae_decode_tiled", "--vae_encode_tile_size", tile, "--vae_decode_tile_size", tile,
                  "--vae_encode_tile_overlap", "64", "--vae_decode_tile_overlap", "64"])
             pngs = sorted(glob.glob(os.path.join(sd, "**", "*.png"), recursive=True))
@@ -278,6 +282,10 @@ class Job:
             if self.stop and self.stop.is_set(): raise RuntimeError("Stopped")
             seg = os.path.join(self.work, f"seg{c:04d}{ext}"); segs.append(seg)
             start = c * self.chunk_sec; length = min(self.chunk_sec, dur - start)
+            if c in self.skip_chunks:
+                self.log(f"Chunk {c+1}/{nchunks}: already done on the PC (skipped)")
+                if self.progress: self.progress((c + 1) / nchunks, 0, 0)
+                continue
             if os.path.exists(seg) and os.path.getsize(seg) > 1000:
                 self.log(f"Chunk {c+1}/{nchunks}: already done (resume)")
                 self._publish_chunk(seg, start, length, dur)
@@ -312,6 +320,9 @@ class Job:
             self.log(f"   {spd:.2f} frames/s")
             if self.progress: self.progress((c + 1) / nchunks, remain, spd)
             for d in (d_in, d_up, os.path.join(self.work, "rife")): shutil.rmtree(d, ignore_errors=True)
+        if self.no_concat:
+            self.log(f"Chunks finished in {(time.time()-t0)/60:.1f} min (joined on the PC)")
+            return None
         lst = os.path.join(self.work, "list.txt")
         with open(lst, "w") as f:
             for s in segs: f.write(f"file '{s}'\n")
