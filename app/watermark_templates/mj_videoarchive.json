@@ -1,0 +1,8 @@
+{
+  "name": "MJ VideoArchive (lettering and dancer)",
+  "image": "mj_videoarchive.png",
+  "mask": "mj_videoarchive_mask.png",
+  "features": "mj_videoarchive_features.png",
+  "graphic": "mj_videoarchive_graphic.png",
+  "provenance": "Graphic outline supplied by the user, registered to original source with 171 SIFT inliers; lettering from reviewed text mask."
+}
