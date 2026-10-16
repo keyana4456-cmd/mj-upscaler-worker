@@ -1,4 +1,4 @@
-﻿"""Runpod Serverless worker for MJ Upscaler: same pipeline as the Modal `process` function.
+"""Runpod Serverless worker for MJ Upscaler: same pipeline as the Modal `process` function.
 Network volume is mounted at /runpod-volume; /io and /models are symlinks into it.
 Speed: all scratch work (frames, clean-up, SeedVR2 input/output) runs on the container's local disk; the input video and
 models are copied to local disk once per worker; only finished chunks (seg*.mp4 / cleaned.mp4) are written to the volume.
@@ -64,6 +64,7 @@ def handler(job):
     except Exception as e: T(f"onnxruntime check failed: {e}")
     if settings.get("mode") == "Fast": settings["mode"] = "Max (natural)"
     previews = []; pfile = _progress_path(name, settings)
+    if inp.get("ptag"): pfile = pfile[:-len(".progress.json")] + f".{inp['ptag']}.progress.json"   # one file per parallel job
     st = dict(state="running", progress=0, eta=-1, fps=0, phase="starting", gpu=gpu_name)
     lock = threading.Lock()
     def status(**kw):
