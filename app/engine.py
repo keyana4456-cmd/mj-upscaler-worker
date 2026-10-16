@@ -51,7 +51,7 @@ def crop_detect(src, dur):
         return None
 
 def target_size(w, h, choice):
-    th = 2160 if choice.startswith("4K") else 1080
+    th = 2160 if choice.startswith("4K") else (1440 if choice.startswith("2K") else 1080)   # SeedVR2's own size is unchanged; only the final lanczos step grows
     tw = int(round(th * w / h / 2) * 2)
     return tw, th
 
