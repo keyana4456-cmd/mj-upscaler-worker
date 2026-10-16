@@ -47,6 +47,7 @@ def _progress_path(name, settings):
 
 def handler(job):
     T0 = time.time(); _prep()
+    jdir = os.path.join(LOCAL, "jobs", str(job.get("id", time.time())).replace("/", "_"))
     inp = job["input"]; name = inp["name"]; settings = dict(inp["settings"])
     import torch
     if not torch.cuda.is_available():
@@ -98,9 +99,9 @@ def handler(job):
             print(s, flush=True)
             if s.startswith("Chunk") or s.startswith("Clean-up") or "frames/s" in s: status(phase=s.strip()[:120])
         j = engine.Job(src, os.path.join(LOCAL, "out"), log=log, progress=None, **settings)
+        j.work = jdir; os.makedirs(j.work, exist_ok=True)     # private scratch per job id (jobs never share or delete each other's files)
         if remote:
             os.makedirs(remote, exist_ok=True)
-            j.work = os.path.join(LOCAL, "jobs", os.path.basename(remote.rstrip("/"))); os.makedirs(j.work, exist_ok=True)
             for n in os.listdir(remote):     # finished chunks already on the volume (earlier Runpod run) + PC's cleaned.mp4
                 if (n.startswith("seg") or n == "cleaned.mp4") and os.path.getsize(os.path.join(remote, n)) > 1000:
                     shutil.copyfile(os.path.join(remote, n), os.path.join(j.work, n)); pre.add(n)
@@ -147,7 +148,7 @@ def handler(job):
         return {"out": vout.replace("/io/", "", 1), "gpu": gpu_name, "seconds": round(time.time() - T0)}
     finally:
         stop_hb.set()
-        shutil.rmtree(os.path.join(LOCAL, "jobs"), ignore_errors=True)
+        shutil.rmtree(jdir, ignore_errors=True)
 
 if __name__ == "__main__":
     runpod.serverless.start({"handler": handler})
