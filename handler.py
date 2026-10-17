@@ -30,13 +30,34 @@ def _copy_tree(src, dst):
             os.makedirs(os.path.dirname(b), exist_ok=True); shutil.copyfile(a, b + ".part"); os.replace(b + ".part", b); n += os.path.getsize(a)
     return n
 
-def _local_models(engine):
-    """Copy SeedVR2 weights from the network volume to local disk once per worker (loads much faster every chunk)."""
-    global _MODELS_READY
-    dst = os.path.join(LOCAL, "models", "seedvr2")
-    if not _MODELS_READY:
-        t = time.time(); n = _copy_tree(os.path.join(VOL, "models", "seedvr2"), dst)
-        T(f"models on local disk ({n/2**30:.2f} GB copied in {time.time()-t:.0f}s)"); _MODELS_READY = True
+HF_URL = "https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/{}"
+_dl_lock = threading.Lock()
+
+def _ensure_on_volume(fname):
+    """Download a SeedVR2 weight straight from Hugging Face onto the network volume once (not via the PC)."""
+    import requests
+    dst = os.path.join(VOL, "models", "seedvr2", fname)
+    with _dl_lock:
+        if os.path.exists(dst) and os.path.getsize(dst) > 1 << 30: return dst
+        t = time.time(); T(f"downloading {fname} from Hugging Face to the volume...")
+        with requests.get(HF_URL.format(fname), stream=True, timeout=120, allow_redirects=True) as r:
+            r.raise_for_status(); total = int(r.headers.get("Content-Length", 0)); got = 0
+            with open(dst + ".part", "wb") as f:
+                for b in r.iter_content(16 << 20): f.write(b); got += len(b)
+        if total and got != total: raise RuntimeError(f"{fname} download incomplete ({got}/{total})")
+        os.replace(dst + ".part", dst); T(f"{fname}: {got/2**30:.1f} GB in {time.time()-t:.0f}s")
+    return dst
+
+def _local_models(engine, dit):
+    """Copy the SeedVR2 weights this job needs from the network volume to local disk once per worker."""
+    dst = os.path.join(LOCAL, "models", "seedvr2"); os.makedirs(dst, exist_ok=True)
+    t = time.time(); n = 0
+    for f in os.listdir(os.path.join(VOL, "models", "seedvr2")):
+        if f.endswith(".part") or (f.startswith("seedvr2_ema_") and f != dit): continue   # only the DiT in use + VAE/config
+        a = os.path.join(VOL, "models", "seedvr2", f); b = os.path.join(dst, f)
+        if os.path.isfile(a) and not (os.path.exists(b) and os.path.getsize(b) == os.path.getsize(a)):
+            shutil.copyfile(a, b + ".part"); os.replace(b + ".part", b); n += os.path.getsize(a)
+    if n: T(f"models on local disk ({n/2**30:.2f} GB copied in {time.time()-t:.0f}s)")
     engine.SEED_MODELS = dst
 
 def _progress_path(name, settings):
@@ -58,7 +79,14 @@ def handler(job):
     import engine
     engine.BIG_GPU = vram >= 40                  # 48 GB+: no offload + big batches
     engine.NO_OFFLOAD = vram >= 20               # 24/32 GB: no CPU offload (models fit), normal batch
-    T(f"GPU {gpu_name} {vram:.0f} GB, big_gpu={engine.BIG_GPU}, no_offload={engine.NO_OFFLOAD}, torch {torch.__version__} cuda {torch.version.cuda}")
+    pro = str(settings.get("quality", "")).startswith("Pro")
+    engine.CLOUD_SEED_RES = int(inp.get("seed_res") or 1080)
+    if vram < 40 and engine.CLOUD_SEED_RES > 1080: engine.CLOUD_SEED_RES = 1080
+    engine.DIT_MODEL = engine.DIT_7B if pro else engine.DIT_3B
+    engine.BLOCKS_TO_SWAP = 20 if (pro and vram < 40) else 0     # 7B fp16 (16 GB) on a 24-32 GB card: stream blocks from RAM
+    engine.SEED_BATCH = 45 if vram >= 120 else (33 if vram >= 70 else 13)   # 1080p working size needs ~2x the memory of 720p
+    T(f"GPU {gpu_name} {vram:.0f} GB, model {engine.DIT_MODEL}, SeedVR2 {engine.CLOUD_SEED_RES}p, batch {engine.SEED_BATCH}, "
+      f"swap {engine.BLOCKS_TO_SWAP}, torch {torch.__version__} cuda {torch.version.cuda}")
     try:
         import onnxruntime as ort; ort.preload_dlls(); prov = ort.get_available_providers(); T(f"ONNX providers: {prov}")
         if "CUDAExecutionProvider" not in prov: T("WARNING: ONNX face/text models will run on the CPU")
@@ -93,7 +121,9 @@ def handler(job):
         if not (os.path.exists(src) and os.path.getsize(src) == os.path.getsize(vsrc)):
             t = time.time(); shutil.copyfile(vsrc, src + ".part"); os.replace(src + ".part", src)
             T(f"video copied to local disk in {time.time()-t:.0f}s")
-        _local_models(engine)
+        if pro:
+            status(phase="getting SeedVR2 7B (first time only)"); _ensure_on_volume(engine.DIT_7B)
+        _local_models(engine, engine.DIT_MODEL)
         remote = os.path.join(VOL, inp["work"]) if inp.get("work") else None; pre = set()
         def log(s):
             print(s, flush=True)
@@ -113,9 +143,11 @@ def handler(job):
         def chunk_ready(path, start, length, total):
             if os.path.basename(path) in pre: return      # finished earlier: no copy, no preview
             if remote:
-                b = os.path.basename(path); dst = os.path.join(remote, b)
-                if not os.path.exists(dst):
-                    shutil.copyfile(path, dst + ".part"); os.replace(dst + ".part", dst); made.append(b)
+                stem = path[:-4]
+                for pth in [p2 for p2 in (stem + "_head.mkv", stem + "_tail.mkv") if os.path.exists(p2)] + [path]:   # overlap pieces first, body last
+                    b = os.path.basename(pth); dst = os.path.join(remote, b)
+                    if not os.path.exists(dst):
+                        shutil.copyfile(pth, dst + ".part"); os.replace(dst + ".part", dst); made.append(b)
                 cl = os.path.join(j.work, "cleaned.mp4")
                 if os.path.exists(cl) and not os.path.exists(os.path.join(remote, "cleaned.mp4")):
                     shutil.copyfile(cl, os.path.join(remote, "cleaned.mp4.part")); os.replace(os.path.join(remote, "cleaned.mp4.part"), os.path.join(remote, "cleaned.mp4"))

@@ -16,7 +16,15 @@ NO_OFFLOAD = os.environ.get("MJU_NO_OFFLOAD") == "1"  # cloud 24-32 GB cards: ke
 NOWIN = 0x08000000 if os.name == "nt" else 0
 
 HEAVY = "Heavy restore (very bad footage)"
-SEED_RES = {"Max (natural)": 720, "Max (slowest, 1080p)": 1080, HEAVY: 1080}  # SeedVR2 internal short side; final lanczos to target
+SEED_RES = {"Max (natural)": 720, "Max (slowest, 1080p)": 1080, HEAVY: 1080}  # SeedVR2 internal short side (PC defaults); final resize to target
+CLOUD_SEED_RES = 0      # cloud worker sets this (1080 / 1440): SeedVR2 works at this short side instead of the PC default
+DIT_3B = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
+DIT_7B = "seedvr2_ema_7b_fp16.safetensors"
+DIT_MODEL = DIT_3B      # cloud worker switches to DIT_7B for "Pro 7B"
+BLOCKS_TO_SWAP = 0      # 7B on a 24 GB card: stream this many DiT blocks from CPU RAM
+SEED_BATCH = 0          # 0 = default (45 big GPU / 21 otherwise); must be 4n+1
+OVERLAP_SEC = 0.5       # chunks render this much extra lead-in; joins are crossfaded over it
+QUALITY_VERSION = 2     # bumps the job key: v2 = overlap/crossfade joins + new face/scale settings
 
 def run(cmd, log=None, **kw):
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
@@ -59,7 +67,7 @@ def target_size(w, h, choice):
 FFHQ = np.array([[192.98138, 239.94708], [318.90277, 240.1936], [256.63416, 314.01935],
                  [201.26117, 371.41043], [313.08905, 371.15118]], np.float32)
 class FaceRestorer:
-    def __init__(self, fidelity=0.8, strength=0.35):
+    def __init__(self, fidelity=0.9, strength=0.25, min_face=96, smooth=0.6):
         import onnxruntime as ort
         try: ort.preload_dlls()  # use the CUDA/cuDNN libraries that ship with PyTorch
         except Exception: pass
@@ -68,6 +76,8 @@ class FaceRestorer:
         self.sess = ort.InferenceSession(os.path.join(ROOT, "models", "codeformer.onnx"), providers=providers)
         self.inputs = {i.name: i for i in self.sess.get_inputs()}
         self.fid, self.strength = fidelity, strength
+        self.min_face, self.smooth = min_face, smooth
+        self.tracks = []   # [(cx, cy, w, landmarks, weight)] from the previous frame: EMA smoothing kills shimmer
         self.det = None; self.mask = None
         self.processed_faces = 0
     def close(self):
@@ -79,11 +89,20 @@ class FaceRestorer:
             self.det = cv2.FaceDetectorYN.create(os.path.join(ROOT, "models", "yunet.onnx"), "", (w, h), 0.8)
             self.det_size = (w, h)
         _, faces = self.det.detect(img)
-        if faces is None: return img
-        out = img.astype(np.float32)
+        if faces is None: self.tracks = []; return img
+        out = img.astype(np.float32); tracks = []
         for f in faces:
-            if f[2] < 48: continue  # too small to help
+            if f[2] < self.min_face: continue  # small faces: CodeFormer can't add real detail there, only identity risk
             lm = f[4:14].reshape(5, 2).astype(np.float32)
+            cx, cy, fw = f[0] + f[2] / 2, f[1] + f[3] / 2, f[2]
+            prev = min(self.tracks, key=lambda t: (t[0] - cx) ** 2 + (t[1] - cy) ** 2, default=None)
+            if prev is not None and (prev[0] - cx) ** 2 + (prev[1] - cy) ** 2 < (0.5 * fw) ** 2:
+                moved = np.abs(lm - prev[3]).max() / fw
+                k = self.smooth if moved < 0.04 else (0.25 if moved < 0.12 else 0.0)   # smooth jitter, follow real motion (no ghosting)
+                lm = k * prev[3] + (1 - k) * lm
+                wgt = min(1.0, prev[4] + 0.25)                            # ease in over 4 frames, no popping
+            else: wgt = 0.25
+            tracks.append((cx, cy, fw, lm, wgt))
             M, _ = cv2.estimateAffinePartial2D(lm, FFHQ, method=cv2.LMEDS)
             crop = cv2.warpAffine(img, M, (512, 512), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
             x = crop[:, :, ::-1].astype(np.float32) / 255.0
@@ -98,7 +117,7 @@ class FaceRestorer:
             if self.mask is None:
                 mask = np.zeros((512, 512), np.float32)
                 cv2.ellipse(mask, (256, 290), (170, 215), 0, 0, 360, 1, -1)
-                self.mask = cv2.GaussianBlur(mask, (0, 0), 25) * self.strength
+                self.mask = cv2.GaussianBlur(mask, (0, 0), 25)
             IM = cv2.invertAffineTransform(M)
             # Paste back only inside the face's bounding box (the mask is 0 elsewhere): same pixels, much less work.
             pts = cv2.transform(np.array([[[0, 0], [511, 0], [0, 511], [511, 511]]], np.float32), IM)[0]
@@ -107,8 +126,9 @@ class FaceRestorer:
             if x1 <= x0 or y1 <= y0: continue
             T = IM.copy(); T[0, 2] -= x0; T[1, 2] -= y0
             yb = cv2.warpAffine(y, T, (x1 - x0, y1 - y0), flags=cv2.INTER_LINEAR)
-            mb = cv2.warpAffine(self.mask, T, (x1 - x0, y1 - y0))[:, :, None]
+            mb = cv2.warpAffine(self.mask, T, (x1 - x0, y1 - y0))[:, :, None] * (self.strength * wgt)
             out[y0:y1, x0:x1] = out[y0:y1, x0:x1] * (1 - mb) + yb * mb
+        self.tracks = tracks
         return np.clip(out, 0, 255).astype(np.uint8)
 
 
@@ -127,7 +147,8 @@ def post_frames(d_in, d_out, fast=False, face_restorer=None):
 class Job:
     def __init__(self, src, out_dir, mode="Max (natural)", res="4K", codec="H.264",
                  deinterlace=False, denoise=True, face=False, grain=True, interp=False,
-                 chunk_sec=8, limit_sec=0, log=print, progress=None, preview=None, stop=None, clean=None, chunk_ready=None, color=None):
+                 chunk_sec=8, limit_sec=0, log=print, progress=None, preview=None, stop=None, clean=None, chunk_ready=None, color=None,
+                 quality="Standard 3B"):
         if mode == HEAVY: denoise, face, grain = False, True, True  # preset: own deblock/denoise pre-pass
         self.__dict__.update(locals()); del self.__dict__["self"]
         self.color = normalize_color(color)
@@ -148,6 +169,8 @@ class Job:
         self.out = os.path.join(out_dir, f"{base}_{tag}_{res.split()[0]}{'_60' if interp else ''}{f'_first{limit_sec:g}s' if limit_sec else ''}{color_suffix(self.color)}{self.cleanup_tag}{ext}")
         key_parts = [src, os.path.getsize(src), mode, res, codec, deinterlace, denoise, face, grain, interp, chunk_sec, limit_sec]
         if self.color: key_parts.append({'color': self.color})
+        key_parts.append({'qv': QUALITY_VERSION})
+        if str(quality).startswith("Pro"): key_parts.append({'quality': 'pro7b'})
         if clean and (clean.get('text') or clean.get('logo') or clean.get('boxes')):
             from cleanup_precision import VERSION
             key_parts.append({'cleanup_version': VERSION, 'clean': clean})
@@ -193,17 +216,23 @@ class Job:
         i = self.info
         if self.mode in SEED_RES:
             short = min(i["w"], i["h"])
-            res = max(SEED_RES[self.mode], short)
+            base = max(SEED_RES[self.mode], CLOUD_SEED_RES or 0)
+            th = target_size(i["w"], i["h"], self.res)[1]
+            res = max(min(base, th), short)     # never above the output size, never below the source
             tile = "512" if res > 900 else "1024"
+            dit = DIT_MODEL if str(self.quality).startswith("Pro") else DIT_3B
+            if str(self.quality).startswith("Pro") and dit != DIT_7B: self.log("Pro 7B runs on the cloud only; this chunk uses Standard 3B")
+            bs = SEED_BATCH or int(os.environ.get("MJU_SEED_BATCH", "45" if BIG_GPU else "21"))
+            self.log(f"SeedVR2 {'7B' if dit == DIT_7B else '3B'} at {res}p (batch {bs})")
             vid = os.path.join(self.work, "seed_in.mp4")
             run([FFMPEG, "-v", "error", "-y", "-framerate", str(i["fps"]), "-i", os.path.join(d_in, "%06d.png"),
                  "-c:v", "libx264", "-preset", "ultrafast", "-qp", "0", "-pix_fmt", "yuv444p", vid])
             sd = os.path.join(self.work, "seed_out"); shutil.rmtree(sd, ignore_errors=True)
             self._run_seed([PY, SEED_CLI, vid, "--output", sd, "--output_format", "png", "--model_dir", SEED_MODELS,
-                 "--dit_model", "seedvr2_ema_3b_fp8_e4m3fn.safetensors", "--resolution", str(res),
-                 "--batch_size", "21", "--temporal_overlap", "4", "--color_correction", "lab",
-                 *(["--batch_size", os.environ.get("MJU_SEED_BATCH", "45")] if BIG_GPU else
-                   (["--batch_size", os.environ.get("MJU_SEED_BATCH", "21")] if NO_OFFLOAD else ["--dit_offload_device", "cpu", "--vae_offload_device", "cpu"])),
+                 "--dit_model", dit, "--resolution", str(res),
+                 "--batch_size", str(bs), "--temporal_overlap", "4", "--color_correction", "lab",
+                 *([] if (BIG_GPU or NO_OFFLOAD) and not BLOCKS_TO_SWAP else ["--dit_offload_device", "cpu", "--vae_offload_device", "cpu"]),
+                 *(["--blocks_to_swap", str(BLOCKS_TO_SWAP)] if BLOCKS_TO_SWAP else []),
                  "--vae_encode_tiled", "--vae_decode_tiled", "--vae_encode_tile_size", tile, "--vae_decode_tile_size", tile,
                  "--vae_encode_tile_overlap", "64", "--vae_decode_tile_overlap", "64"])
             pngs = sorted(glob.glob(os.path.join(sd, "**", "*.png"), recursive=True))
@@ -230,9 +259,9 @@ class Job:
             if self.face_r is not None:
                 self.face_r.close(); self.face_r = None
 
-    def _encode(self, d, fps, seg):
+    def _encode(self, d, fps, seg, start=1, count=0):
         tw, th = target_size(self.info["w"], self.info["h"], self.res)
-        vf = f"scale={tw}:{th}:flags=lanczos"
+        vf = f"scale={tw}:{th}:flags=bicubic+accurate_rnd+full_chroma_int"   # bicubic: no lanczos ringing/halos
         grade = color_filter(self.color)
         if grade: vf += ',' + grade
         if self.grain: vf += ",noise=c0s=5:c0f=t+u"
@@ -240,7 +269,41 @@ class Job:
             enc = ["-vf", vf + ",format=yuv422p10le", "-c:v", "prores_ks", "-profile:v", "3"]
         else:
             enc = ["-vf", vf + ",format=yuv420p", "-c:v", "libx264", "-crf", "14", "-preset", "slow", "-profile:v", "high"]
-        run([FFMPEG, "-v", "error", "-y", "-framerate", str(fps), "-i", os.path.join(d, "%06d.png")] + enc + [seg])
+        run([FFMPEG, "-v", "error", "-y", "-framerate", str(fps), "-start_number", str(start), "-i", os.path.join(d, "%06d.png")]
+            + (["-frames:v", str(count)] if count else []) + enc + [seg])
+
+    # ---- overlapping chunks: chunk c>0 renders OVERLAP_SEC of lead-in ("head"); chunk c<last keeps its last
+    # OVERLAP_SEC apart ("tail"). Head/tail are stored lossless (pre-encode) and crossfaded at the join. ----
+    def _ov(self, nchunks):
+        return 0 if self.interp or nchunks < 2 else int(round(OVERLAP_SEC * self.info["fps"]))
+    def chunk_files(self, c, nchunks, ext):
+        b = os.path.join(self.work, f"seg{c:04d}")
+        f = [b + ext]
+        if self._ov(nchunks):
+            if c > 0: f.append(b + "_head.mkv")
+            if c < nchunks - 1: f.append(b + "_tail.mkv")
+        return f
+    def chunk_done(self, c, nchunks, ext):
+        return all(os.path.exists(p) and os.path.getsize(p) > 1000 for p in self.chunk_files(c, nchunks, ext))
+    def _lossless(self, d, fps, start, count, dst):
+        run([FFMPEG, "-v", "error", "-y", "-framerate", str(fps), "-start_number", str(start), "-i", os.path.join(d, "%06d.png"),
+             "-frames:v", str(count), "-c:v", "ffv1", "-level", "3", dst + ".part.mkv"])
+        os.replace(dst + ".part.mkv", dst)
+    def _crossfade(self, tail, head, fps, dst):
+        a, b = os.path.join(self.work, "xa"), os.path.join(self.work, "xb")
+        for d in (a, b): shutil.rmtree(d, ignore_errors=True); os.makedirs(d)
+        run([FFMPEG, "-v", "error", "-y", "-i", tail, os.path.join(a, "%06d.png")])
+        run([FFMPEG, "-v", "error", "-y", "-i", head, os.path.join(b, "%06d.png")])
+        fa, fb = sorted(os.listdir(a)), sorted(os.listdir(b)); n = min(len(fa), len(fb))
+        for k in range(n):
+            A = cv2.imread(os.path.join(a, fa[k])).astype(np.float32); B = cv2.imread(os.path.join(b, fb[k]))
+            if B.shape != A.shape: B = cv2.resize(B, (A.shape[1], A.shape[0]), interpolation=cv2.INTER_AREA)
+            t = (k + 0.5) / n
+            cv2.imwrite(os.path.join(a, f"{k+1:06d}.png"), np.clip(A * (1 - t) + B.astype(np.float32) * t, 0, 255).astype(np.uint8),
+                        [cv2.IMWRITE_PNG_COMPRESSION, 1])
+        for extra in fa[n:]: os.remove(os.path.join(a, extra))
+        self._encode(a, fps, dst, count=n)
+        for d in (a, b): shutil.rmtree(d, ignore_errors=True)
 
     def _publish_chunk(self, path, start, length, total):
         if self.chunk_ready:
@@ -286,7 +349,7 @@ class Job:
                 self.log(f"Chunk {c+1}/{nchunks}: already done on the PC (skipped)")
                 if self.progress: self.progress((c + 1) / nchunks, 0, 0)
                 continue
-            if os.path.exists(seg) and os.path.getsize(seg) > 1000:
+            if self.chunk_done(c, nchunks, ext):
                 self.log(f"Chunk {c+1}/{nchunks}: already done (resume)")
                 self._publish_chunk(seg, start, length, dur)
                 if self.progress: self.progress((c + 1) / nchunks, 0, 0)
@@ -295,12 +358,14 @@ class Job:
             d_in, d_up = os.path.join(self.work, "in"), os.path.join(self.work, "up")
             for d in (d_in, d_up): shutil.rmtree(d, ignore_errors=True)
             os.makedirs(d_in)
-            nf = int(round(length * fps))
-            cmd = [FFMPEG, "-v", "error", "-y", "-ss", f"{start:.4f}", "-i", self.src, "-map", "0:V:0", "-frames:v", str(nf)]
+            nf = int(round(length * fps)); ov = self._ov(nchunks)
+            lead = ov if c > 0 else 0
+            cmd = [FFMPEG, "-v", "error", "-y", "-ss", f"{max(0.0, start - lead / fps):.4f}", "-i", self.src, "-map", "0:V:0", "-frames:v", str(nf + lead)]
             pf = self._pre_filter()
             if pf: cmd += ["-vf", pf]
             run(cmd + ["-compression_level", "1", os.path.join(d_in, "%06d.png")])
             nf = len(os.listdir(d_in))
+            tail = ov if (c < nchunks - 1 and nf - lead > ov) else 0
             cs = time.time()
             self._upscale(d_in, d_up, nf)
             d_fin, ofps = d_up, fps
@@ -312,7 +377,10 @@ class Job:
             if self.preview:
                 mid = f"{nf//2+1:06d}.png"
                 self.preview(os.path.join(d_in, mid), os.path.join(d_up, mid))
-            self._encode(d_fin, ofps, seg)
+            if lead: self._lossless(d_fin, ofps, 1, lead, seg[:-len(ext)] + "_head.mkv")
+            if tail: self._lossless(d_fin, ofps, nf - tail + 1, tail, seg[:-len(ext)] + "_tail.mkv")
+            self._encode(d_fin, ofps, seg + ".part" + ext, start=lead + 1, count=nf - lead - tail)
+            os.replace(seg + ".part" + ext, seg)       # body last: its presence (with head/tail) marks the chunk done
             self._publish_chunk(seg, start, length, dur)
             done_frames += nf
             spd = nf / (time.time() - cs)
@@ -324,8 +392,18 @@ class Job:
             self.log(f"Chunks finished in {(time.time()-t0)/60:.1f} min (joined on the PC)")
             return None
         lst = os.path.join(self.work, "list.txt")
+        ov = self._ov(nchunks); parts = []
+        for c, s in enumerate(segs):
+            if ov and c > 0:
+                jn = os.path.join(self.work, f"join{c:04d}{ext}")
+                if not (os.path.exists(jn) and os.path.getsize(jn) > 1000):
+                    self._crossfade(segs[c - 1][:-len(ext)] + "_tail.mkv", s[:-len(ext)] + "_head.mkv", fps * (2 if self.interp else 1), jn + ".part" + ext)
+                    os.replace(jn + ".part" + ext, jn)
+                parts.append(jn)
+            parts.append(s)
+        if ov: self.log(f"Joined {len(segs)} chunks with {ov}-frame crossfades")
         with open(lst, "w") as f:
-            for s in segs: f.write(f"file '{s}'\n")
+            for s in parts: f.write(f"file '{s}'\n")
         acodec = ["-c:a", "pcm_s16le"] if ext == ".mov" else ["-c:a", "aac", "-b:a", "320k"]
         run([FFMPEG, "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", lst, "-t", f"{dur:.3f}", "-i", self.src,
              "-map", "0:v", "-map", "1:a:0?", "-c:v", "copy"] + acodec + ["-shortest", self.out])
