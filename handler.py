@@ -31,6 +31,8 @@ def _copy_tree(src, dst):
     return n
 
 HF_URL = "https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/{}"
+HF_REPO = {"seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors": "AInVFX/SeedVR2_comfyUI"}
+DIT_7B_FP8 = "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors"
 _dl_lock = threading.Lock()
 
 def _ensure_on_volume(fname):
@@ -40,7 +42,8 @@ def _ensure_on_volume(fname):
     with _dl_lock:
         if os.path.exists(dst) and os.path.getsize(dst) > 1 << 30: return dst
         t = time.time(); T(f"downloading {fname} from Hugging Face to the volume...")
-        with requests.get(HF_URL.format(fname), stream=True, timeout=120, allow_redirects=True) as r:
+        url = f"https://huggingface.co/{HF_REPO[fname]}/resolve/main/{fname}" if fname in HF_REPO else HF_URL.format(fname)
+        with requests.get(url, stream=True, timeout=120, allow_redirects=True) as r:
             r.raise_for_status(); total = int(r.headers.get("Content-Length", 0)); got = 0
             with open(dst + ".part", "wb") as f:
                 for b in r.iter_content(16 << 20): f.write(b); got += len(b)
@@ -82,11 +85,22 @@ def handler(job):
     pro = str(settings.get("quality", "")).startswith("Pro")
     engine.CLOUD_SEED_RES = int(inp.get("seed_res") or 1080)
     if vram < 40 and engine.CLOUD_SEED_RES > 1080: engine.CLOUD_SEED_RES = 1080
+    # --- speed v3: everything picked from the card's memory at runtime; job input can override for benchmarks ---
+    big = vram >= 40
+    if pro: engine.DIT_7B = engine.DIT_7B if big else DIT_7B_FP8        # 24-32 GB: 7B fp8 (~8.5 GB) fits, no block swapping
     engine.DIT_MODEL = engine.DIT_7B if pro else engine.DIT_3B
-    engine.BLOCKS_TO_SWAP = 20 if (pro and vram < 40) else 0     # 7B fp16 (16 GB) on a 24-32 GB card: stream blocks from RAM
-    engine.SEED_BATCH = 45 if vram >= 120 else (33 if vram >= 70 else 13)   # 1080p working size needs ~2x the memory of 720p
+    engine.BLOCKS_TO_SWAP = int(inp.get("blocks_to_swap", 0))           # 0 everywhere now (H100/B200: fp16 fits; 4090: fp8 fits)
+    engine.NO_OFFLOAD = engine.NO_OFFLOAD or engine.BLOCKS_TO_SWAP == 0
+    engine.SEED_BATCH = int(inp.get("batch") or (45 if vram >= 120 else (33 if vram >= 70 else (21 if not pro else 13))))
+    engine.TEMPORAL_OVERLAP = int(inp.get("overlap", 4 if not big else 3))
+    engine.COLOR_CORRECTION = str(inp.get("color_correction", "lab"))   # "none" = skip LAB color transfer
+    cc = torch.cuda.get_device_capability(0); attn = str(inp.get("attention", "auto"))
+    if attn == "auto":
+        try: import sageattention; attn = "sageattn_2" if cc in ((8, 9), (9, 0)) else "sdpa"
+        except Exception: attn = "sdpa"
+    engine.ATTENTION = attn
     T(f"GPU {gpu_name} {vram:.0f} GB, model {engine.DIT_MODEL}, SeedVR2 {engine.CLOUD_SEED_RES}p, batch {engine.SEED_BATCH}, "
-      f"swap {engine.BLOCKS_TO_SWAP}, torch {torch.__version__} cuda {torch.version.cuda}")
+      f"swap {engine.BLOCKS_TO_SWAP}, overlap {engine.TEMPORAL_OVERLAP}, attention {engine.ATTENTION}, color {engine.COLOR_CORRECTION}, torch {torch.__version__} cuda {torch.version.cuda}")
     try:
         import onnxruntime as ort; ort.preload_dlls(); prov = ort.get_available_providers(); T(f"ONNX providers: {prov}")
         if "CUDAExecutionProvider" not in prov: T("WARNING: ONNX face/text models will run on the CPU")
@@ -122,7 +136,7 @@ def handler(job):
             t = time.time(); shutil.copyfile(vsrc, src + ".part"); os.replace(src + ".part", src)
             T(f"video copied to local disk in {time.time()-t:.0f}s")
         if pro:
-            status(phase="getting SeedVR2 7B (first time only)"); _ensure_on_volume(engine.DIT_7B)
+            status(phase="getting SeedVR2 7B (first time only)"); _ensure_on_volume(engine.DIT_7B) if pro else None
         _local_models(engine, engine.DIT_MODEL)
         remote = os.path.join(VOL, inp["work"]) if inp.get("work") else None; pre = set()
         def log(s):

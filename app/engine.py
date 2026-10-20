@@ -1,4 +1,4 @@
-"""MJ Upscaler engine: chunked, resumable video upscaling for old footage."""
+﻿"""MJ Upscaler engine: chunked, resumable video upscaling for old footage."""
 import os, sys, json, glob, math, shutil, subprocess, time, hashlib
 import numpy as np, cv2
 from color_tools import normalize as normalize_color, color_filter, color_suffix
@@ -23,6 +23,9 @@ DIT_7B = "seedvr2_ema_7b_fp16.safetensors"
 DIT_MODEL = DIT_3B      # cloud worker switches to DIT_7B for "Pro 7B"
 BLOCKS_TO_SWAP = 0      # 7B on a 24 GB card: stream this many DiT blocks from CPU RAM
 SEED_BATCH = 0          # 0 = default (45 big GPU / 21 otherwise); must be 4n+1
+ATTENTION = "sdpa"      # cloud worker sets "sageattn_2" when SageAttention is installed and the GPU supports it
+COLOR_CORRECTION = "lab"  # "none" skips SeedVR2's LAB color transfer (faster)
+TEMPORAL_OVERLAP = 4
 OVERLAP_SEC = 0.5       # chunks render this much extra lead-in; joins are crossfaded over it
 QUALITY_VERSION = 2     # bumps the job key: v2 = overlap/crossfade joins + new face/scale settings
 
@@ -67,7 +70,11 @@ def target_size(w, h, choice):
 FFHQ = np.array([[192.98138, 239.94708], [318.90277, 240.1936], [256.63416, 314.01935],
                  [201.26117, 371.41043], [313.08905, 371.15118]], np.float32)
 class FaceRestorer:
-    def __init__(self, fidelity=0.9, strength=0.25, min_face=96, smooth=0.6):
+    """Identity-safe CodeFormer touch-up.
+    strength 0 = Faithful (CodeFormer w=0.95, light blend) .. 1 = Stronger (w=0.6, heavier blend).
+    Keeps the original skin texture/grain, smooths the restored face over time, skips tiny or uncertain faces,
+    and checks identity (SFace embedding, original vs restored); low similarity -> much lighter blend."""
+    def __init__(self, fidelity=None, strength=None, min_face=96, smooth=0.6, min_conf=0.75, id_thresh=0.55):
         import onnxruntime as ort
         try: ort.preload_dlls()  # use the CUDA/cuDNN libraries that ship with PyTorch
         except Exception: pass
@@ -75,34 +82,47 @@ class FaceRestorer:
             ('CUDAExecutionProvider', {'use_tf32': 1 if os.environ.get('MJU_FACE_TF32') == '1' else 0}), 'CPUExecutionProvider']
         self.sess = ort.InferenceSession(os.path.join(ROOT, "models", "codeformer.onnx"), providers=providers)
         self.inputs = {i.name: i for i in self.sess.get_inputs()}
-        self.fid, self.strength = fidelity, strength
-        self.min_face, self.smooth = min_face, smooth
-        self.tracks = []   # [(cx, cy, w, landmarks, weight)] from the previous frame: EMA smoothing kills shimmer
+        s = float(os.environ.get("MJU_FACE_STRENGTH", "0.2")) if strength is None else float(strength)
+        s = min(1.0, max(0.0, s)); self.level = s
+        self.fid = (0.95 - 0.35 * s) if fidelity is None else fidelity      # 0.95 .. 0.60 (higher = more like the original)
+        self.strength = 0.20 + 0.40 * s                                      # partial blend 0.20 .. 0.60
+        self.texture = 0.8 - 0.4 * s                                         # how much original fine detail/grain is put back
+        self.min_face, self.smooth, self.min_conf, self.id_thresh = min_face, smooth, min_conf, id_thresh
+        self.tracks = []   # [(cx, cy, w, landmarks, weight, prev_restored_512)]
         self.det = None; self.mask = None
-        self.processed_faces = 0
+        self.processed_faces = 0; self.skipped = 0; self.id_low = 0; self.sims = []
+        self.rec = None
+        p = os.path.join(ROOT, "models", "sface.onnx")
+        if os.path.exists(p):
+            try: self.rec = cv2.FaceRecognizerSF.create(p, "")
+            except Exception: self.rec = None
     def close(self):
         # Release ORT's CUDA allocator before the next SeedVR2 chunk.
-        self.sess = None; self.det = None
+        self.sess = None; self.det = None; self.rec = None
+    def _embed(self, img, face):
+        return self.rec.feature(self.rec.alignCrop(img, face))
     def __call__(self, img):
         h, w = img.shape[:2]
         if self.det is None or self.det_size != (w, h):
-            self.det = cv2.FaceDetectorYN.create(os.path.join(ROOT, "models", "yunet.onnx"), "", (w, h), 0.8)
+            self.det = cv2.FaceDetectorYN.create(os.path.join(ROOT, "models", "yunet.onnx"), "", (w, h), 0.6)
             self.det_size = (w, h)
         _, faces = self.det.detect(img)
         if faces is None: self.tracks = []; return img
         out = img.astype(np.float32); tracks = []
+        detail = out - cv2.GaussianBlur(out, (0, 0), 1.6)   # original fine texture / grain
         for f in faces:
-            if f[2] < self.min_face: continue  # small faces: CodeFormer can't add real detail there, only identity risk
+            if f[2] < self.min_face or f[14] < self.min_conf:
+                self.skipped += 1; continue   # tiny or uncertain face: don't invent one
             lm = f[4:14].reshape(5, 2).astype(np.float32)
             cx, cy, fw = f[0] + f[2] / 2, f[1] + f[3] / 2, f[2]
             prev = min(self.tracks, key=lambda t: (t[0] - cx) ** 2 + (t[1] - cy) ** 2, default=None)
+            k = 0.0
             if prev is not None and (prev[0] - cx) ** 2 + (prev[1] - cy) ** 2 < (0.5 * fw) ** 2:
                 moved = np.abs(lm - prev[3]).max() / fw
-                k = self.smooth if moved < 0.04 else (0.25 if moved < 0.12 else 0.0)   # smooth jitter, follow real motion (no ghosting)
+                k = self.smooth if moved < 0.04 else (0.25 if moved < 0.12 else 0.0)   # smooth jitter, follow real motion
                 lm = k * prev[3] + (1 - k) * lm
                 wgt = min(1.0, prev[4] + 0.25)                            # ease in over 4 frames, no popping
-            else: wgt = 0.25
-            tracks.append((cx, cy, fw, lm, wgt))
+            else: prev = None; wgt = 0.25
             M, _ = cv2.estimateAffinePartial2D(lm, FFHQ, method=cv2.LMEDS)
             crop = cv2.warpAffine(img, M, (512, 512), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
             x = crop[:, :, ::-1].astype(np.float32) / 255.0
@@ -113,21 +133,35 @@ class FaceRestorer:
                 else: feed[name] = np.array([self.fid], dtype=np.float64 if "double" in inp.type else np.float32)
             y = self.sess.run(None, feed)[0][0].transpose(1, 2, 0)
             self.processed_faces += 1
-            y = ((np.clip(y, -1, 1) + 1) / 2 * 255.0)[:, :, ::-1]
+            y = ((np.clip(y, -1, 1) + 1) / 2 * 255.0)[:, :, ::-1].astype(np.float32)
+            # temporal smoothing of the restored face itself (stops flicker / morphing between frames)
+            if prev is not None and prev[5] is not None and k > 0: y = 0.65 * y + 0.35 * prev[5]
+            tracks.append((cx, cy, fw, lm, wgt, y))
+            amt = self.strength
+            if self.rec is not None:
+                try:
+                    yi = np.clip(y, 0, 255).astype(np.uint8)
+                    # compare in the same aligned space: original crop vs restored crop
+                    fl = np.array([0, 0, 512, 512] + list(FFHQ.reshape(-1)) + [1.0], np.float32)
+                    sim = float(self.rec.match(self._embed(crop, fl), self._embed(yi, fl), cv2.FaceRecognizerSF_FR_COSINE))
+                    self.sims.append(sim)
+                    if sim < self.id_thresh: amt *= 0.35; self.id_low += 1   # looks like someone else: barely touch it
+                except Exception: pass
             if self.mask is None:
                 mask = np.zeros((512, 512), np.float32)
-                cv2.ellipse(mask, (256, 290), (170, 215), 0, 0, 360, 1, -1)
-                self.mask = cv2.GaussianBlur(mask, (0, 0), 25)
+                cv2.ellipse(mask, (256, 290), (165, 210), 0, 0, 360, 1, -1)
+                self.mask = cv2.GaussianBlur(mask, (0, 0), 30)          # wide feather
             IM = cv2.invertAffineTransform(M)
-            # Paste back only inside the face's bounding box (the mask is 0 elsewhere): same pixels, much less work.
             pts = cv2.transform(np.array([[[0, 0], [511, 0], [0, 511], [511, 511]]], np.float32), IM)[0]
             x0, y0 = max(0, int(np.floor(pts[:, 0].min())) - 2), max(0, int(np.floor(pts[:, 1].min())) - 2)
             x1, y1 = min(w, int(np.ceil(pts[:, 0].max())) + 3), min(h, int(np.ceil(pts[:, 1].max())) + 3)
             if x1 <= x0 or y1 <= y0: continue
             T = IM.copy(); T[0, 2] -= x0; T[1, 2] -= y0
             yb = cv2.warpAffine(y, T, (x1 - x0, y1 - y0), flags=cv2.INTER_LINEAR)
-            mb = cv2.warpAffine(self.mask, T, (x1 - x0, y1 - y0))[:, :, None] * (self.strength * wgt)
-            out[y0:y1, x0:x1] = out[y0:y1, x0:x1] * (1 - mb) + yb * mb
+            mb = cv2.warpAffine(self.mask, T, (x1 - x0, y1 - y0))[:, :, None] * (amt * wgt)
+            reg = out[y0:y1, x0:x1]
+            blended = reg * (1 - mb) + yb * mb
+            out[y0:y1, x0:x1] = blended + detail[y0:y1, x0:x1] * mb * self.texture   # put the original skin texture back
         self.tracks = tracks
         return np.clip(out, 0, 255).astype(np.uint8)
 
@@ -230,7 +264,8 @@ class Job:
             sd = os.path.join(self.work, "seed_out"); shutil.rmtree(sd, ignore_errors=True)
             self._run_seed([PY, SEED_CLI, vid, "--output", sd, "--output_format", "png", "--model_dir", SEED_MODELS,
                  "--dit_model", dit, "--resolution", str(res),
-                 "--batch_size", str(bs), "--temporal_overlap", "4", "--color_correction", "lab",
+                 "--batch_size", str(bs), "--temporal_overlap", str(TEMPORAL_OVERLAP), "--color_correction", COLOR_CORRECTION,
+                 *(["--attention_mode", ATTENTION] if ATTENTION != "sdpa" else []),
                  *([] if (BIG_GPU or NO_OFFLOAD) and not BLOCKS_TO_SWAP else ["--dit_offload_device", "cpu", "--vae_offload_device", "cpu"]),
                  *(["--blocks_to_swap", str(BLOCKS_TO_SWAP)] if BLOCKS_TO_SWAP else []),
                  "--vae_encode_tiled", "--vae_decode_tiled", "--vae_encode_tile_size", tile, "--vae_decode_tile_size", tile,
