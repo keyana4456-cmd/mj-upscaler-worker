@@ -1,0 +1,7 @@
+# Application-only release: reuse the successfully built CUDA/SageAttention stack.
+# Rebuild Dockerfile when changing native dependencies, then update this pinned digest.
+FROM ghcr.io/keyana4456-cmd/mj-upscaler-worker@sha256:b96b8facefa8ad4d0fcc63496f068c44821f65332d3033e9397bcac51412c5bb
+COPY app/ /opt/mju/
+COPY handler.py /opt/mju/handler.py
+COPY tests/ /tmp/mju-tests/
+RUN PYTHONPATH=/opt/mju python -m unittest discover -s /tmp/mju-tests -v

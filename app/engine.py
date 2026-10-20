@@ -182,8 +182,11 @@ class Job:
     def __init__(self, src, out_dir, mode="Max (natural)", res="4K", codec="H.264",
                  deinterlace=False, denoise=True, face=False, grain=True, interp=False,
                  chunk_sec=8, limit_sec=0, log=print, progress=None, preview=None, stop=None, clean=None, chunk_ready=None, color=None,
-                 quality="Standard 3B"):
+                 quality="Standard 3B", face_override=None):
         if mode == HEAVY: denoise, face, grain = False, True, True  # preset: own deblock/denoise pre-pass
+        if face_override is not None:
+            if not isinstance(face_override, bool): raise ValueError("face_override must be a boolean")
+            face = face_override
         self.__dict__.update(locals()); del self.__dict__["self"]
         self.color = normalize_color(color)
         from cleanup_precision import cleanup_suffix

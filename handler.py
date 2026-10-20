@@ -96,8 +96,9 @@ def handler(job):
     engine.COLOR_CORRECTION = str(inp.get("color_correction", "lab"))   # "none" = skip LAB color transfer
     cc = torch.cuda.get_device_capability(0); attn = str(inp.get("attention", "auto"))
     if attn == "auto":
-        try: import sageattention; attn = "sageattn_2" if cc in ((8, 9), (9, 0)) else "sdpa"
-        except Exception: attn = "sdpa"
+        try: from sageattention import sageattn_varlen; attn = "sageattn_2" if cc in ((8, 9), (9, 0)) else "sdpa"
+        except Exception as ex:
+            T(f"SageAttention unavailable; using SDPA: {ex}"); attn = "sdpa"
     engine.ATTENTION = attn
     T(f"GPU {gpu_name} {vram:.0f} GB, model {engine.DIT_MODEL}, SeedVR2 {engine.CLOUD_SEED_RES}p, batch {engine.SEED_BATCH}, "
       f"swap {engine.BLOCKS_TO_SWAP}, overlap {engine.TEMPORAL_OVERLAP}, attention {engine.ATTENTION}, color {engine.COLOR_CORRECTION}, torch {torch.__version__} cuda {torch.version.cuda}")
@@ -106,9 +107,15 @@ def handler(job):
         if "CUDAExecutionProvider" not in prov: T("WARNING: ONNX face/text models will run on the CPU")
     except Exception as e: T(f"onnxruntime check failed: {e}")
     if settings.get("mode") == "Fast": settings["mode"] = "Max (natural)"
+    if "face" in inp:
+        if not isinstance(inp["face"], bool): return {"error": "face must be a JSON boolean"}
+        settings["face_override"] = inp["face"]  # explicit override also applies to Heavy restore
     previews = []; pfile = _progress_path(name, settings)
     if inp.get("ptag"): pfile = pfile[:-len(".progress.json")] + f".{inp['ptag']}.progress.json"   # one file per parallel job
-    st = dict(state="running", progress=0, eta=-1, fps=0, phase="starting", gpu=gpu_name)
+    runtime = dict(model=engine.DIT_MODEL, attention=engine.ATTENTION, batch=engine.SEED_BATCH,
+                   blocks_to_swap=engine.BLOCKS_TO_SWAP, color_correction=engine.COLOR_CORRECTION,
+                   overlap=engine.TEMPORAL_OVERLAP, seed_res=engine.CLOUD_SEED_RES)
+    st = dict(state="running", progress=0, eta=-1, fps=0, phase="starting", gpu=gpu_name, runtime=runtime)
     lock = threading.Lock()
     def status(**kw):
         with lock:
@@ -186,12 +193,12 @@ def handler(job):
             segs = sorted(n for n in os.listdir(remote) if n.startswith("seg")) if remote else []
             status(state="done", progress=1, eta=0, fps=0, phase="chunks done")
             T(f"job done in {time.time()-T0:.0f}s, {len(made)} new chunk(s)")
-            return {"segs": segs, "new": made, "work": inp.get("work"), "gpu": gpu_name, "seconds": round(time.time() - T0)}
+            return {"segs": segs, "new": made, "work": inp.get("work"), "gpu": gpu_name, "seconds": round(time.time() - T0), "runtime": runtime}
         vout = f"/io/out/{os.path.splitext(name)[0]}/" + os.path.basename(out)
         os.makedirs(os.path.dirname(vout), exist_ok=True); shutil.copyfile(out, vout + ".part"); os.replace(vout + ".part", vout)
         status(state="done", progress=1, eta=0, fps=0, out=vout.replace("/io/", "", 1))
         T(f"job done in {time.time()-T0:.0f}s")
-        return {"out": vout.replace("/io/", "", 1), "gpu": gpu_name, "seconds": round(time.time() - T0)}
+        return {"out": vout.replace("/io/", "", 1), "gpu": gpu_name, "seconds": round(time.time() - T0), "runtime": runtime}
     finally:
         stop_hb.set()
         shutil.rmtree(jdir, ignore_errors=True)
